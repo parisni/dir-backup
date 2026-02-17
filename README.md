@@ -37,21 +37,23 @@ Notes:
 - `local_abs_path` must be an absolute directory path.
 - Data is streamed: local `tar | gzip` -> SSH -> remote `gzip -d | tar -x`.
 - Remote destination is created if missing.
+- `--owner` and `--group` apply only when the SSH user is `root`.
+- If SSH user is not `root`, extracted files are owned by the SSH user.
 
 ## Examples
 
 Copy local directory contents into remote target directory:
 
 ```bash
-dir-backup scp /tmp/gimp/ natus:/tmp/gimp/
+dir-backup scp /tmp/gimp/ user@host:/tmp/gimp/
 ```
 
 Try forcing ownership/group during extraction:
 
 ```bash
-dir-backup scp --owner backup --group backup /tmp/gimp/ natus:/tmp/gimp/
+dir-backup scp --owner backup --group backup /tmp/gimp/ user@host:/tmp/gimp/
 ```
 
 Important:
-- Without root privileges on remote, ownership changes may not apply.
-
+- Without SSH as `root`, ownership changes (`--owner`/`--group`) do not apply.
+- Files are owned by the SSH connection user when not running as `root`.
