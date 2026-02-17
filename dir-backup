@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  dir-backup scp [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>
+  dir-backup archive ...
+  dir-backup unarchive ...
+
+Notes:
+  - `scp` streams tar+gzip over SSH and extracts remotely in one pass.
+  - `scp` is directory-only.
+  - `scp` requires absolute paths.
+EOF
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+is_abs_path() {
+  [[ "$1" == /* ]]
+}
+
+parse_remote() {
+  local input="$1"
+  [[ "$input" == *:* ]] || return 1
+  local host_part="${input%%:*}"
+  local path_part="${input#*:}"
+  [[ -n "$host_part" ]] || return 1
+  [[ -n "$path_part" ]] || return 1
+  printf '%s\n%s\n' "$host_part" "$path_part"
+}
+
+shell_quote() {
+  local s="$1"
+  printf "'%s'" "${s//\'/\'\"\'\"\'}"
+}
+
+cmd_scp() {
+  local force_owner=""
+  local force_group=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --owner)
+        [[ $# -ge 2 ]] || die "--owner requires a value"
+        force_owner="$2"
+        shift 2
+        ;;
+      --group)
+        [[ $# -ge 2 ]] || die "--group requires a value"
+        force_group="$2"
+        shift 2
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        die "unknown scp option: $1"
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  [[ $# -eq 2 ]] || die "scp expects: [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>"
+
+  local local_path="$1"
+  local remote_spec="$2"
+
+  is_abs_path "$local_path" || die "local path must be absolute: $local_path"
+  [[ -e "$local_path" ]] || die "local path does not exist: $local_path"
+  [[ -d "$local_path" ]] || die "local path must be a directory: $local_path"
+
+  local parsed
+  parsed="$(parse_remote "$remote_spec")" || die "remote path must be in form user@host:/absolute/path"
+
+  local remote_host
+  local remote_path
+  remote_host="$(printf '%s' "$parsed" | sed -n '1p')"
+  remote_path="$(printf '%s' "$parsed" | sed -n '2p')"
+
+  is_abs_path "$remote_path" || die "remote path must be absolute: $remote_path"
+
+  local owner_group_args=""
+  if [[ -n "$force_owner" ]]; then
+    owner_group_args+=" --owner=$(shell_quote "$force_owner")"
+  fi
+  if [[ -n "$force_group" ]]; then
+    owner_group_args+=" --group=$(shell_quote "$force_group")"
+  fi
+
+  echo "Streaming '$local_path' to '$remote_host:$remote_path'..."
+
+  local remote_cmd
+  remote_cmd="mkdir -p $(shell_quote "$remote_path") && gzip -d | tar -xpf - -C $(shell_quote "$remote_path")$owner_group_args"
+
+  # Directory source: copy contents into remote target (no extra nesting).
+  tar -C "$local_path" -cf - . \
+    | gzip -1 \
+    | ssh "$remote_host" "$remote_cmd"
+
+  echo "Transfer complete."
+}
+
+cmd_archive() {
+  die "archive is not implemented yet"
+}
+
+cmd_unarchive() {
+  die "unarchive is not implemented yet"
+}
+
+main() {
+  [[ $# -gt 0 ]] || {
+    usage
+    exit 1
+  }
+
+  local subcmd="$1"
+  shift
+
+  case "$subcmd" in
+    scp)
+      cmd_scp "$@"
+      ;;
+    archive)
+      cmd_archive "$@"
+      ;;
+    unarchive)
+      cmd_unarchive "$@"
+      ;;
+    -h|--help|help)
+      usage
+      ;;
+    *)
+      die "unknown subcommand: $subcmd"
+      ;;
+  esac
+}
+
+main "$@"
