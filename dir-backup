@@ -5,13 +5,17 @@ usage() {
   cat <<'EOF'
 Usage:
   dir-backup scp [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>
-  dir-backup archive ...
-  dir-backup unarchive ...
+  dir-backup archive <output.tar.gz> <abs_path1> [<abs_path2> ...]
+  dir-backup unarchive <archive.tar.gz> [<dest_dir>]
 
 Notes:
   - `scp` streams tar+gzip over SSH and extracts remotely in one pass.
   - `scp` is directory-only.
   - `scp` requires absolute paths.
+  - `archive` packs one or more local directories into a local .tar.gz.
+  - `archive` requires absolute source paths and an absolute output path.
+  - `unarchive` without <dest_dir> restores to original absolute paths.
+  - `unarchive` with <dest_dir> extracts relative to that directory.
 EOF
 }
 
@@ -109,11 +113,63 @@ cmd_scp() {
 }
 
 cmd_archive() {
-  die "archive is not implemented yet"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --) shift; break ;;
+      -*) die "unknown archive option: $1" ;;
+      *)  break ;;
+    esac
+  done
+
+  [[ $# -ge 2 ]] || die "archive expects: <output.tar.gz> <abs_path1> [<abs_path2> ...]"
+
+  local output="$1"
+  shift
+
+  is_abs_path "$output" || die "output path must be absolute: $output"
+
+  local path
+  for path in "$@"; do
+    is_abs_path "$path" || die "source path must be absolute: $path"
+    [[ -e "$path" ]]    || die "source path does not exist: $path"
+    [[ -d "$path" ]]    || die "source path must be a directory: $path"
+  done
+
+  echo "Archiving $# director(ies) to '$output'..."
+  tar --absolute-names -czf "$output" "$@"
+  echo "Archive complete."
 }
 
 cmd_unarchive() {
-  die "unarchive is not implemented yet"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --) shift; break ;;
+      -*) die "unknown unarchive option: $1" ;;
+      *)  break ;;
+    esac
+  done
+
+  [[ $# -ge 1 && $# -le 2 ]] || die "unarchive expects: <archive.tar.gz> [<dest_dir>]"
+
+  local archive="$1"
+
+  is_abs_path "$archive" || die "archive path must be absolute: $archive"
+  [[ -e "$archive" ]]    || die "archive does not exist: $archive"
+  [[ -f "$archive" ]]    || die "archive path must be a regular file: $archive"
+
+  if [[ $# -eq 2 ]]; then
+    local dest_dir="$2"
+    is_abs_path "$dest_dir" || die "dest_dir must be absolute: $dest_dir"
+    [[ -e "$dest_dir" ]]   || die "dest_dir does not exist: $dest_dir"
+    [[ -d "$dest_dir" ]]   || die "dest_dir must be a directory: $dest_dir"
+    echo "Extracting '$archive' into '$dest_dir'..."
+    tar -xzf "$archive" -C "$dest_dir"
+  else
+    echo "Extracting '$archive' to original paths..."
+    tar --absolute-names -xzf "$archive"
+  fi
+
+  echo "Extraction complete."
 }
 
 main() {
