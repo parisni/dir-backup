@@ -5,14 +5,14 @@ usage() {
   cat <<'EOF'
 Usage:
   dir-backup scp [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>
-  dir-backup archive <output.tar.gz> <abs_path1> [<abs_path2> ...]
+  dir-backup archive <output.tar.gz> <abs_path_or_file1> [<abs_path_or_file2> ...]
   dir-backup unarchive <archive.tar.gz> [<dest_dir>]
 
 Notes:
   - `scp` streams tar+gzip over SSH and extracts remotely in one pass.
   - `scp` is directory-only.
   - `scp` requires absolute paths.
-  - `archive` packs one or more local directories into a local .tar.gz.
+  - `archive` packs one or more local files or directories into a local .tar.gz.
   - `archive` requires absolute source paths and an absolute output path.
   - `unarchive` without <dest_dir> restores to original absolute paths.
   - `unarchive` with <dest_dir> extracts relative to that directory.
@@ -132,10 +132,9 @@ cmd_archive() {
   for path in "$@"; do
     is_abs_path "$path" || die "source path must be absolute: $path"
     [[ -e "$path" ]]    || die "source path does not exist: $path"
-    [[ -d "$path" ]]    || die "source path must be a directory: $path"
   done
 
-  echo "Archiving $# director(ies) to '$output'..."
+  echo "Archiving $# item(s) to '$output'..."
   tar --absolute-names -czf "$output" "$@"
   echo "Archive complete."
 }
