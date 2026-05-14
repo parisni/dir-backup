@@ -6,7 +6,7 @@ usage() {
 Usage:
   dir-backup scp [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>
   dir-backup archive <output.tar.gz> <abs_path_or_file1> [<abs_path_or_file2> ...]
-  dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz> [<dest_dir>]
+  dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
 
 Notes:
   - `scp` streams tar+gzip over SSH and extracts remotely in one pass.
@@ -17,6 +17,7 @@ Notes:
   - `unarchive` without <dest_dir> restores to original absolute paths.
   - `unarchive` with <dest_dir> extracts relative to that directory.
   - `unarchive --remap` rewrites a path prefix at extraction time (e.g. /home/nparis:/home/parisni).
+  - `unarchive` streams the archive over SSH when the source is `user@host:/abs/path`; nothing is downloaded to disk.
 EOF
 }
 
@@ -162,13 +163,24 @@ cmd_unarchive() {
     esac
   done
 
-  [[ $# -ge 1 && $# -le 2 ]] || die "unarchive expects: [--remap OLD:NEW] <archive.tar.gz> [<dest_dir>]"
+  [[ $# -ge 1 && $# -le 2 ]] || die "unarchive expects: [--remap OLD:NEW] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]"
 
   local archive="$1"
 
-  is_abs_path "$archive" || die "archive path must be absolute: $archive"
-  [[ -e "$archive" ]]    || die "archive does not exist: $archive"
-  [[ -f "$archive" ]]    || die "archive path must be a regular file: $archive"
+  # Detect remote source (user@host:/abs/path) vs local file. Remote sources are
+  # streamed over SSH and never written to local disk.
+  local remote_host=""
+  local remote_path=""
+  local parsed
+  if parsed="$(parse_remote "$archive")"; then
+    remote_host="$(printf '%s' "$parsed" | sed -n '1p')"
+    remote_path="$(printf '%s' "$parsed" | sed -n '2p')"
+    is_abs_path "$remote_path" || die "remote archive path must be absolute: $remote_path"
+  else
+    is_abs_path "$archive" || die "archive path must be absolute: $archive"
+    [[ -e "$archive" ]]    || die "archive does not exist: $archive"
+    [[ -f "$archive" ]]    || die "archive path must be a regular file: $archive"
+  fi
 
   local transform_arg=""
   if [[ -n "$remap" ]]; then
@@ -181,17 +193,25 @@ cmd_unarchive() {
     transform_arg="--transform=s|^${remap_old}|${remap_new}|"
   fi
 
+  local extract_dir
   if [[ $# -eq 2 ]]; then
-    local dest_dir="$2"
-    is_abs_path "$dest_dir" || die "dest_dir must be absolute: $dest_dir"
-    [[ -e "$dest_dir" ]]   || die "dest_dir does not exist: $dest_dir"
-    [[ -d "$dest_dir" ]]   || die "dest_dir must be a directory: $dest_dir"
-    echo "Extracting '$archive' into '$dest_dir'..."
-    tar ${transform_arg:+"$transform_arg"} -xzf "$archive" -C "$dest_dir"
+    extract_dir="$2"
+    is_abs_path "$extract_dir" || die "dest_dir must be absolute: $extract_dir"
+    [[ -e "$extract_dir" ]]   || die "dest_dir does not exist: $extract_dir"
+    [[ -d "$extract_dir" ]]   || die "dest_dir must be a directory: $extract_dir"
+    echo "Extracting '$archive' into '$extract_dir'..."
   else
-    echo "Extracting '$archive' to original paths..."
     # Archive stores paths relative to /; extract to / restores absolute locations
-    tar ${transform_arg:+"$transform_arg"} -xzf "$archive" -C /
+    extract_dir="/"
+    echo "Extracting '$archive' to original paths..."
+  fi
+
+  if [[ -n "$remote_host" ]]; then
+    # Stream archive bytes over SSH directly into local tar; nothing is written to disk.
+    ssh "$remote_host" "cat $(shell_quote "$remote_path")" \
+      | tar ${transform_arg:+"$transform_arg"} -xzf - -C "$extract_dir"
+  else
+    tar ${transform_arg:+"$transform_arg"} -xzf "$archive" -C "$extract_dir"
   fi
 
   echo "Extraction complete."
