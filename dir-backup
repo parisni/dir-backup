@@ -6,7 +6,7 @@ usage() {
 Usage:
   dir-backup scp [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>
   dir-backup archive <output.tar.gz> <abs_path_or_file1> [<abs_path_or_file2> ...]
-  dir-backup unarchive [--progress] [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
+  dir-backup unarchive [--progress] [--remap OLD_PREFIX:NEW_PREFIX] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
 
 Notes:
   - `scp` streams tar+gzip over SSH and extracts remotely in one pass.
@@ -19,6 +19,7 @@ Notes:
   - `unarchive --remap` rewrites a path prefix at extraction time (e.g. /home/nparis:/home/parisni).
   - `unarchive` streams the archive over SSH when the source is `user@host:/abs/path`; nothing is downloaded to disk.
   - `unarchive --progress` shows a transfer progress bar via `pv` (requires `pv` to be installed; e.g. `apt-get install pv`).
+  - `unarchive --exclude-folder NAME` skips any directory whose basename equals NAME, at any depth (literal name, no globs). Repeatable.
 EOF
 }
 
@@ -151,6 +152,8 @@ cmd_archive() {
 cmd_unarchive() {
   local remap=""
   local progress=0
+  # Repeatable flag: each entry is a literal folder name to exclude at any depth.
+  local -a exclude_folders=()
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -163,13 +166,24 @@ cmd_unarchive() {
         progress=1
         shift
         ;;
+      --exclude-folder)
+        [[ $# -ge 2 ]] || die "--exclude-folder requires a value"
+        local ef="$2"
+        [[ -n "$ef" ]] || die "--exclude-folder value must not be empty"
+        # Enforce literal folder name: reject path separators and tar glob metachars
+        # so the contract stays "a folder name" rather than "a tar pattern".
+        [[ "$ef" != */* ]] || die "--exclude-folder takes a folder name, not a path: $ef"
+        [[ "$ef" != *[\*\?\[]* ]] || die "--exclude-folder takes a folder name, not a pattern: $ef"
+        exclude_folders+=("$ef")
+        shift 2
+        ;;
       --) shift; break ;;
       -*) die "unknown unarchive option: $1" ;;
       *)  break ;;
     esac
   done
 
-  [[ $# -ge 1 && $# -le 2 ]] || die "unarchive expects: [--progress] [--remap OLD:NEW] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]"
+  [[ $# -ge 1 && $# -le 2 ]] || die "unarchive expects: [--progress] [--remap OLD:NEW] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]"
 
   local archive="$1"
 
@@ -215,6 +229,15 @@ cmd_unarchive() {
     transform_arg="--transform=s|^${remap_old}|${remap_new}|"
   fi
 
+  # Build tar exclude args: for each folder name, exclude both the top-level
+  # entry and any nested occurrence. tar applies excludes recursively to
+  # matched directories, so this skips the whole subtree.
+  local -a exclude_args=()
+  local name
+  for name in "${exclude_folders[@]}"; do
+    exclude_args+=("--exclude=$name" "--exclude=*/$name")
+  done
+
   local extract_dir
   if [[ $# -eq 2 ]]; then
     extract_dir="$2"
@@ -233,17 +256,17 @@ cmd_unarchive() {
     if [[ "$progress" -eq 1 ]]; then
       ssh "$remote_host" "cat $(shell_quote "$remote_path")" \
         | pv -s "$archive_size" \
-        | tar ${transform_arg:+"$transform_arg"} -xzf - -C "$extract_dir"
+        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xzf - -C "$extract_dir"
     else
       ssh "$remote_host" "cat $(shell_quote "$remote_path")" \
-        | tar ${transform_arg:+"$transform_arg"} -xzf - -C "$extract_dir"
+        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xzf - -C "$extract_dir"
     fi
   else
     if [[ "$progress" -eq 1 ]]; then
       pv -s "$archive_size" -- "$archive" \
-        | tar ${transform_arg:+"$transform_arg"} -xzf - -C "$extract_dir"
+        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xzf - -C "$extract_dir"
     else
-      tar ${transform_arg:+"$transform_arg"} -xzf "$archive" -C "$extract_dir"
+      tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xzf "$archive" -C "$extract_dir"
     fi
   fi
 
