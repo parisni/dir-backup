@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Replaced by the release workflow at packaging time
+# (sed -i "s/__VERSION__/${GITHUB_REF_NAME#v}/" on the packaged copy).
+# When unreplaced (local dev / git clone), `--version` reports "dev".
+VERSION="__VERSION__"
+
 usage() {
   cat <<'EOF'
 Usage:
   dir-backup scp [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>
   dir-backup archive <output.tar.gz> <abs_path_or_file1> [<abs_path_or_file2> ...]
   dir-backup unarchive [--progress] [--remap OLD_PREFIX:NEW_PREFIX] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
+  dir-backup --version | -V | version
 
 Notes:
   - `scp` streams tar+gzip over SSH and extracts remotely in one pass.
@@ -291,6 +297,19 @@ main() {
       ;;
     unarchive)
       cmd_unarchive "$@"
+      ;;
+    --version|-V|version)
+      # When unreplaced (local dev / git clone), the placeholder is shown as "dev"
+      # so users can tell they are not on a released build. The sentinel is
+      # reassembled at runtime so the release workflow's sed does not rewrite
+      # this comparison branch (which would otherwise always be true and
+      # always print "dev").
+      placeholder="__""VERSION""__"
+      if [[ "$VERSION" == "$placeholder" ]]; then
+        printf 'dir-backup dev\n'
+      else
+        printf 'dir-backup %s\n' "$VERSION"
+      fi
       ;;
     -h|--help|help)
       usage

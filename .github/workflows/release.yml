@@ -20,6 +20,10 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp dir-backup dist/dir-backup
+          # Inject the git tag as VERSION so `dir-backup --version` matches
+          # the release the user installed. GITHUB_REF_NAME is e.g. "v1.5.0";
+          # we strip the leading "v" to follow common --version conventions.
+          sed -i "s/__VERSION__/${GITHUB_REF_NAME#v}/" dist/dir-backup
           chmod +x dist/dir-backup
 
           tar -C dist -czf "dir-backup_${GITHUB_REF_NAME}_linux_amd64.tar.gz" dir-backup
