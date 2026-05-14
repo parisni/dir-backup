@@ -6,7 +6,7 @@ usage() {
 Usage:
   dir-backup scp [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>
   dir-backup archive <output.tar.gz> <abs_path_or_file1> [<abs_path_or_file2> ...]
-  dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
+  dir-backup unarchive [--progress] [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
 
 Notes:
   - `scp` streams tar+gzip over SSH and extracts remotely in one pass.
@@ -18,6 +18,7 @@ Notes:
   - `unarchive` with <dest_dir> extracts relative to that directory.
   - `unarchive --remap` rewrites a path prefix at extraction time (e.g. /home/nparis:/home/parisni).
   - `unarchive` streams the archive over SSH when the source is `user@host:/abs/path`; nothing is downloaded to disk.
+  - `unarchive --progress` shows a transfer progress bar via `pv` (requires `pv` to be installed; e.g. `apt-get install pv`).
 EOF
 }
 
@@ -149,6 +150,7 @@ cmd_archive() {
 
 cmd_unarchive() {
   local remap=""
+  local progress=0
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -157,13 +159,17 @@ cmd_unarchive() {
         remap="$2"
         shift 2
         ;;
+      --progress)
+        progress=1
+        shift
+        ;;
       --) shift; break ;;
       -*) die "unknown unarchive option: $1" ;;
       *)  break ;;
     esac
   done
 
-  [[ $# -ge 1 && $# -le 2 ]] || die "unarchive expects: [--remap OLD:NEW] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]"
+  [[ $# -ge 1 && $# -le 2 ]] || die "unarchive expects: [--progress] [--remap OLD:NEW] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]"
 
   local archive="$1"
 
@@ -180,6 +186,22 @@ cmd_unarchive() {
     is_abs_path "$archive" || die "archive path must be absolute: $archive"
     [[ -e "$archive" ]]    || die "archive does not exist: $archive"
     [[ -f "$archive" ]]    || die "archive path must be a regular file: $archive"
+  fi
+
+  # --progress relies on `pv` (https://www.ivarch.com/programs/pv.shtml) to render
+  # a real progress bar with ETA. We require both `pv` and a known byte size so
+  # the bar is meaningful; otherwise we fail fast rather than degrade silently.
+  local archive_size=""
+  if [[ "$progress" -eq 1 ]]; then
+    command -v pv >/dev/null 2>&1 || die "--progress requires pv (e.g. apt-get install pv)"
+    if [[ -n "$remote_host" ]]; then
+      archive_size="$(ssh "$remote_host" "stat -c %s -- $(shell_quote "$remote_path")" 2>/dev/null)" \
+        || die "could not stat remote archive: $remote_host:$remote_path"
+    else
+      archive_size="$(stat -c %s -- "$archive" 2>/dev/null)" \
+        || die "could not stat local archive: $archive"
+    fi
+    [[ "$archive_size" =~ ^[0-9]+$ ]] || die "could not determine archive size for --progress"
   fi
 
   local transform_arg=""
@@ -208,10 +230,21 @@ cmd_unarchive() {
 
   if [[ -n "$remote_host" ]]; then
     # Stream archive bytes over SSH directly into local tar; nothing is written to disk.
-    ssh "$remote_host" "cat $(shell_quote "$remote_path")" \
-      | tar ${transform_arg:+"$transform_arg"} -xzf - -C "$extract_dir"
+    if [[ "$progress" -eq 1 ]]; then
+      ssh "$remote_host" "cat $(shell_quote "$remote_path")" \
+        | pv -s "$archive_size" \
+        | tar ${transform_arg:+"$transform_arg"} -xzf - -C "$extract_dir"
+    else
+      ssh "$remote_host" "cat $(shell_quote "$remote_path")" \
+        | tar ${transform_arg:+"$transform_arg"} -xzf - -C "$extract_dir"
+    fi
   else
-    tar ${transform_arg:+"$transform_arg"} -xzf "$archive" -C "$extract_dir"
+    if [[ "$progress" -eq 1 ]]; then
+      pv -s "$archive_size" -- "$archive" \
+        | tar ${transform_arg:+"$transform_arg"} -xzf - -C "$extract_dir"
+    else
+      tar ${transform_arg:+"$transform_arg"} -xzf "$archive" -C "$extract_dir"
+    fi
   fi
 
   echo "Extraction complete."
