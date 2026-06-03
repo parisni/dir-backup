@@ -1,8 +1,8 @@
 # dir-backup
 
-`dir-backup` packs files and directories into a `tar + gzip` archive, locally or
-streamed to a remote host over SSH, without writing the archive to disk on the
-network path.
+`dir-backup` packs files and directories into a `tar` archive (gzip or zstd),
+locally or streamed to a remote host over SSH, without writing the archive to
+disk on the network path.
 
 It provides two subcommands:
 
@@ -38,7 +38,7 @@ sudo mv dir-backup /usr/local/bin/dir-backup
 ## Usage
 
 ```bash
-dir-backup archive [--extract [--remap OLD_PREFIX:NEW_PREFIX] [--dest /remote_dir]] [--owner OWNER] [--group GROUP] <output> <abs_path1> [<abs_path2> ...]
+dir-backup archive [--compression gzip|zstd] [--extract [--remap OLD_PREFIX:NEW_PREFIX] [--dest /remote_dir]] [--owner OWNER] [--group GROUP] <output> <abs_path1> [<abs_path2> ...]
 dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
 ```
 
@@ -46,6 +46,7 @@ dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host
 
 - Packs one or more files or directories into a `.tar.gz`.
 - Source paths must be absolute.
+- `--compression` selects `gzip` (default) or `zstd`; it applies to `archive` only. `unarchive` detects the format automatically. `zstd` must be installed locally, and on the remote when using `--extract`.
 - `<output>` is local when absolute (`/path.tar.gz`) and remote when a remote-spec (`user@host:/path.tar.gz`); a leading `/` always means local.
 - A remote `<output>` streams the data and writes the raw `.tar.gz` remotely (no local copy is kept).
 - `--extract` (remote only) extracts the stream on the remote host instead of writing the archive. Paths are stored relative to `/`, restoring absolute locations; `--dest /dir` extracts relative to a directory and `--remap OLD:NEW` rewrites a prefix.
@@ -55,6 +56,7 @@ dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host
 ### `unarchive`
 
 - Source can be a local archive (`/abs/path/file.tar.gz`) or a remote one (`user@host:/abs/path/file.tar.gz`).
+- The compression format (gzip or zstd) is detected automatically; `zstd` must be installed where the archive is decompressed (locally, or on the remote for streamed sources).
 - Remote sources are streamed over SSH (`ssh host 'cat …' | tar -xzf -`) and are never written to local disk.
 - Without `<dest_dir>`, files are restored to their original absolute paths (extraction relative to `/`).
 - With `<dest_dir>`, files are extracted relative to that directory.

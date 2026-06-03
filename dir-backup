@@ -9,13 +9,16 @@ VERSION="__VERSION__"
 usage() {
   cat <<'EOF'
 Usage:
-  dir-backup archive [--extract [--remap OLD_PREFIX:NEW_PREFIX] [--dest /remote_dir]] [--owner OWNER] [--group GROUP] <output> <abs_path1> [<abs_path2> ...]
+  dir-backup archive [--compression gzip|zstd] [--extract [--remap OLD_PREFIX:NEW_PREFIX] [--dest /remote_dir]] [--owner OWNER] [--group GROUP] <output> <abs_path1> [<abs_path2> ...]
   dir-backup unarchive [--progress] [--remap OLD_PREFIX:NEW_PREFIX] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
   dir-backup --version | -V | version
 
 Notes:
   - `archive` packs one or more local files or directories into a .tar.gz.
   - `archive` requires absolute source paths.
+  - `--compression` selects gzip (default) or zstd; it applies to `archive`
+    only. `unarchive` detects the format automatically. `zstd` must be installed
+    locally, and on the remote when using `--extract`.
   - <output> is local when absolute (/path.tar.gz), remote when a remote-spec
     (user@host:/path.tar.gz). A leading "/" always means local.
   - A remote <output> streams over SSH and writes the raw .tar.gz remotely.
@@ -63,6 +66,7 @@ cmd_archive() {
   local dest_dir=""
   local force_owner=""
   local force_group=""
+  local compression="gzip"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -78,6 +82,11 @@ cmd_archive() {
       --dest)
         [[ $# -ge 2 ]] || die "--dest requires a value"
         dest_dir="$2"
+        shift 2
+        ;;
+      --compression)
+        [[ $# -ge 2 ]] || die "--compression requires a value (gzip or zstd)"
+        compression="$2"
         shift 2
         ;;
       --owner)
@@ -113,6 +122,20 @@ cmd_archive() {
     rel_paths+=("${path#/}")
   done
 
+  # Pick the tar compression flag from --compression. Local `unarchive` uses
+  # tar's autodetection, but a streamed remote extract cannot autodetect from a
+  # pipe, so the flag is also passed explicitly on the remote side below.
+  local tar_compress_flag
+  case "$compression" in
+    gzip) tar_compress_flag="-z" ;;
+    zstd)
+      tar_compress_flag="--zstd"
+      # zstd must be available locally to compress the stream.
+      command -v zstd >/dev/null 2>&1 || die "zstd not found in PATH (required for --compression zstd)"
+      ;;
+    *) die "unknown compression: $compression (expected gzip or zstd)" ;;
+  esac
+
   # Infer remote vs local from <output>: a leading "/" is always local; otherwise
   # accept the scp-style remote-spec [user@]host:/abs/path (host + absolute path).
   if is_abs_path "$output"; then
@@ -122,7 +145,7 @@ cmd_archive() {
     [[ -z "$force_owner" && -z "$force_group" ]] || die "--owner/--group require --extract (remote only)"
 
     echo "Archiving $# item(s) to '$output'..."
-    tar -czf "$output" -C / "${rel_paths[@]}"
+    tar -c "$tar_compress_flag" -f "$output" -C / "${rel_paths[@]}"
     echo "Archive complete."
     return
   fi
@@ -143,8 +166,9 @@ cmd_archive() {
     [[ -z "$force_owner" && -z "$force_group" ]] || die "--owner/--group require --extract"
 
     echo "Streaming archive of $# item(s) to '$remote_host:$remote_path'..."
-    # Deposit the raw .tar.gz remotely; no local copy is written.
-    tar -czf - -C / "${rel_paths[@]}" \
+    # Deposit the raw archive remotely; no local copy is written. The remote only
+    # runs `cat`, so it needs no decompressor here regardless of --compression.
+    tar -c "$tar_compress_flag" -f - -C / "${rel_paths[@]}" \
       | ssh "$remote_host" "cat > $(shell_quote "$remote_path")"
     echo "Archive complete."
     return
@@ -179,11 +203,32 @@ cmd_archive() {
   fi
 
   echo "Streaming and extracting $# item(s) into '$remote_host:$target'..."
+  # tar autodetects compression only for seekable files; reading from a pipe it
+  # does not, so the remote must be told the format explicitly. When using zstd,
+  # also guard that the remote has the zstd binary tar will shell out to.
+  local remote_guard=""
+  if [[ "$compression" == "zstd" ]]; then
+    remote_guard="command -v zstd >/dev/null 2>&1 || { echo 'Error: zstd not found in remote PATH (required for --compression zstd)' >&2; exit 1; }; "
+  fi
   local remote_cmd
-  remote_cmd="mkdir -p $(shell_quote "$target") && gzip -d | tar -xpf -${transform_arg} -C $(shell_quote "$target")${owner_group_args}"
-  tar -czf - -C / "${rel_paths[@]}" \
+  remote_cmd="${remote_guard}mkdir -p $(shell_quote "$target") && tar -x ${tar_compress_flag} -pf -${transform_arg} -C $(shell_quote "$target")${owner_group_args}"
+  tar -c "$tar_compress_flag" -f - -C / "${rel_paths[@]}" \
     | ssh "$remote_host" "$remote_cmd"
   echo "Extraction complete."
+}
+
+# tar can only autodetect the compression format from a seekable file, not from a
+# pipe. For streamed extractions we therefore decompress on the side that holds
+# the seekable file (locally, or on the remote) by sniffing the magic bytes and
+# choosing the matching decompressor, then feed an uncompressed tar stream into
+# `tar -xf -`. `gzip`/`zstd` magic: 1f8b / 28b52ffd.
+#
+# decompress_cmd <quoted_path> -> emits a shell snippet that writes the
+# uncompressed tar bytes of <quoted_path> to stdout. The snippet is portable
+# enough to run locally (eval) or remotely (over ssh).
+decompress_cmd() {
+  local qpath="$1"
+  printf '%s' "magic=\$(head -c 4 -- ${qpath} | od -An -tx1 | tr -d ' \\n'); case \"\$magic\" in 1f8b*) gzip -dc -- ${qpath};; 28b52ffd*) zstd -dc -- ${qpath};; *) cat -- ${qpath};; esac"
 }
 
 cmd_unarchive() {
@@ -289,21 +334,30 @@ cmd_unarchive() {
   fi
 
   if [[ -n "$remote_host" ]]; then
-    # Stream archive bytes over SSH directly into local tar; nothing is written to disk.
+    # Stream archive bytes over SSH directly into local tar; nothing is written to
+    # disk. The remote holds the seekable file, so it sniffs the format and emits
+    # an uncompressed tar stream, which lets local `tar -xf -` read from the pipe
+    # (tar cannot autodetect compression from a pipe).
+    local remote_decompress
+    remote_decompress="$(decompress_cmd "$(shell_quote "$remote_path")")"
     if [[ "$progress" -eq 1 ]]; then
-      ssh "$remote_host" "cat $(shell_quote "$remote_path")" \
+      ssh "$remote_host" "$remote_decompress" \
         | pv -s "$archive_size" \
-        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xzf - -C "$extract_dir"
+        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xf - -C "$extract_dir"
     else
-      ssh "$remote_host" "cat $(shell_quote "$remote_path")" \
-        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xzf - -C "$extract_dir"
+      ssh "$remote_host" "$remote_decompress" \
+        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xf - -C "$extract_dir"
     fi
   else
     if [[ "$progress" -eq 1 ]]; then
-      pv -s "$archive_size" -- "$archive" \
-        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xzf - -C "$extract_dir"
+      # pv feeds a pipe, so decompress explicitly (sniffed from the seekable file)
+      # before tar, which cannot autodetect compression from a pipe.
+      eval "$(decompress_cmd "$(shell_quote "$archive")")" \
+        | pv -s "$archive_size" \
+        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xf - -C "$extract_dir"
     else
-      tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xzf "$archive" -C "$extract_dir"
+      # Local seekable file: tar autodetects gzip/zstd on its own.
+      tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xf "$archive" -C "$extract_dir"
     fi
   fi
 
