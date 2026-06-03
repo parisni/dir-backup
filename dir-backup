@@ -9,17 +9,21 @@ VERSION="__VERSION__"
 usage() {
   cat <<'EOF'
 Usage:
-  dir-backup scp [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>
-  dir-backup archive <output.tar.gz> <abs_path_or_file1> [<abs_path_or_file2> ...]
+  dir-backup archive [--extract [--remap OLD_PREFIX:NEW_PREFIX] [--dest /remote_dir]] [--owner OWNER] [--group GROUP] <output> <abs_path1> [<abs_path2> ...]
   dir-backup unarchive [--progress] [--remap OLD_PREFIX:NEW_PREFIX] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
   dir-backup --version | -V | version
 
 Notes:
-  - `scp` streams tar+gzip over SSH and extracts remotely in one pass.
-  - `scp` is directory-only.
-  - `scp` requires absolute paths.
-  - `archive` packs one or more local files or directories into a local .tar.gz.
-  - `archive` requires absolute source paths and an absolute output path.
+  - `archive` packs one or more local files or directories into a .tar.gz.
+  - `archive` requires absolute source paths.
+  - <output> is local when absolute (/path.tar.gz), remote when a remote-spec
+    (user@host:/path.tar.gz). A leading "/" always means local.
+  - A remote <output> streams over SSH and writes the raw .tar.gz remotely.
+  - `--extract` (remote only) extracts the stream remotely instead of writing
+    the archive file; archive paths are relative to / (absolute restore).
+  - `--extract --dest /remote_dir` extracts relative to that remote directory.
+  - `--extract --remap OLD:NEW` rewrites a path prefix at extraction time.
+  - `--owner`/`--group` force ownership when extracting remotely.
   - `unarchive` without <dest_dir> restores to original absolute paths.
   - `unarchive` with <dest_dir> extracts relative to that directory.
   - `unarchive --remap` rewrites a path prefix at extraction time (e.g. /home/nparis:/home/parisni).
@@ -53,12 +57,29 @@ shell_quote() {
   printf "'%s'" "${s//\'/\'\"\'\"\'}"
 }
 
-cmd_scp() {
+cmd_archive() {
+  local do_extract=0
+  local remap=""
+  local dest_dir=""
   local force_owner=""
   local force_group=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --extract)
+        do_extract=1
+        shift
+        ;;
+      --remap)
+        [[ $# -ge 2 ]] || die "--remap requires a value"
+        remap="$2"
+        shift 2
+        ;;
+      --dest)
+        [[ $# -ge 2 ]] || die "--dest requires a value"
+        dest_dir="$2"
+        shift 2
+        ;;
       --owner)
         [[ $# -ge 2 ]] || die "--owner requires a value"
         force_owner="$2"
@@ -69,74 +90,16 @@ cmd_scp() {
         force_group="$2"
         shift 2
         ;;
-      --)
-        shift
-        break
-        ;;
-      -*)
-        die "unknown scp option: $1"
-        ;;
-      *)
-        break
-        ;;
-    esac
-  done
-
-  [[ $# -eq 2 ]] || die "scp expects: [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>"
-
-  local local_path="$1"
-  local remote_spec="$2"
-
-  is_abs_path "$local_path" || die "local path must be absolute: $local_path"
-  [[ -e "$local_path" ]] || die "local path does not exist: $local_path"
-  [[ -d "$local_path" ]] || die "local path must be a directory: $local_path"
-
-  local parsed
-  parsed="$(parse_remote "$remote_spec")" || die "remote path must be in form user@host:/absolute/path"
-
-  local remote_host
-  local remote_path
-  remote_host="$(printf '%s' "$parsed" | sed -n '1p')"
-  remote_path="$(printf '%s' "$parsed" | sed -n '2p')"
-
-  is_abs_path "$remote_path" || die "remote path must be absolute: $remote_path"
-
-  local owner_group_args=""
-  if [[ -n "$force_owner" ]]; then
-    owner_group_args+=" --owner=$(shell_quote "$force_owner")"
-  fi
-  if [[ -n "$force_group" ]]; then
-    owner_group_args+=" --group=$(shell_quote "$force_group")"
-  fi
-
-  echo "Streaming '$local_path' to '$remote_host:$remote_path'..."
-
-  local remote_cmd
-  remote_cmd="mkdir -p $(shell_quote "$remote_path") && gzip -d | tar -xpf - -C $(shell_quote "$remote_path")$owner_group_args"
-
-  # Directory source: copy contents into remote target (no extra nesting).
-  tar -C "$local_path" -cf - . \
-    | gzip -1 \
-    | ssh "$remote_host" "$remote_cmd"
-
-  echo "Transfer complete."
-}
-
-cmd_archive() {
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
       --) shift; break ;;
       -*) die "unknown archive option: $1" ;;
       *)  break ;;
     esac
   done
 
-  [[ $# -ge 2 ]] || die "archive expects: <output.tar.gz> <abs_path1> [<abs_path2> ...]"
+  [[ $# -ge 2 ]] || die "archive expects: <output> <abs_path1> [<abs_path2> ...]"
 
   local output="$1"
   shift
-
-  is_abs_path "$output" || die "output path must be absolute: $output"
 
   local path
   for path in "$@"; do
@@ -150,9 +113,77 @@ cmd_archive() {
     rel_paths+=("${path#/}")
   done
 
-  echo "Archiving $# item(s) to '$output'..."
-  tar -czf "$output" -C / "${rel_paths[@]}"
-  echo "Archive complete."
+  # Infer remote vs local from <output>: a leading "/" is always local; otherwise
+  # accept the scp-style remote-spec [user@]host:/abs/path (host + absolute path).
+  if is_abs_path "$output"; then
+    [[ "$do_extract" -eq 0 ]] || die "--extract requires a remote output (use unarchive for local extraction)"
+    [[ -z "$remap" ]]         || die "--remap requires --extract (remote only)"
+    [[ -z "$dest_dir" ]]      || die "--dest requires --extract (remote only)"
+    [[ -z "$force_owner" && -z "$force_group" ]] || die "--owner/--group require --extract (remote only)"
+
+    echo "Archiving $# item(s) to '$output'..."
+    tar -czf "$output" -C / "${rel_paths[@]}"
+    echo "Archive complete."
+    return
+  fi
+
+  local parsed
+  parsed="$(parse_remote "$output")" || die "output must be a local absolute path or a remote-spec user@host:/absolute/path"
+
+  local remote_host
+  local remote_path
+  remote_host="$(printf '%s' "$parsed" | sed -n '1p')"
+  remote_path="$(printf '%s' "$parsed" | sed -n '2p')"
+
+  is_abs_path "$remote_path" || die "remote path must be absolute: $remote_path"
+
+  if [[ "$do_extract" -eq 0 ]]; then
+    [[ -z "$remap" ]]    || die "--remap requires --extract"
+    [[ -z "$dest_dir" ]] || die "--dest requires --extract"
+    [[ -z "$force_owner" && -z "$force_group" ]] || die "--owner/--group require --extract"
+
+    echo "Streaming archive of $# item(s) to '$remote_host:$remote_path'..."
+    # Deposit the raw .tar.gz remotely; no local copy is written.
+    tar -czf - -C / "${rel_paths[@]}" \
+      | ssh "$remote_host" "cat > $(shell_quote "$remote_path")"
+    echo "Archive complete."
+    return
+  fi
+
+  # --extract: stream and extract remotely using unarchive semantics.
+  local transform_arg=""
+  if [[ -n "$remap" ]]; then
+    [[ "$remap" == *:* ]] || die "--remap value must be in form OLD_PREFIX:NEW_PREFIX"
+    local remap_old="${remap%%:*}"
+    local remap_new="${remap#*:}"
+    # Strip leading / since tar strips it before applying --transform
+    remap_old="${remap_old#/}"
+    remap_new="${remap_new#/}"
+    transform_arg=" --transform=$(shell_quote "s|^${remap_old}|${remap_new}|")"
+  fi
+
+  local owner_group_args=""
+  if [[ -n "$force_owner" ]]; then
+    owner_group_args+=" --owner=$(shell_quote "$force_owner")"
+  fi
+  if [[ -n "$force_group" ]]; then
+    owner_group_args+=" --group=$(shell_quote "$force_group")"
+  fi
+
+  # When --dest is given, extract relative to it; otherwise restore to / (paths
+  # are stored relative to /, mirroring `unarchive` without <dest_dir>).
+  local target="/"
+  if [[ -n "$dest_dir" ]]; then
+    is_abs_path "$dest_dir" || die "--dest must be absolute: $dest_dir"
+    target="$dest_dir"
+  fi
+
+  echo "Streaming and extracting $# item(s) into '$remote_host:$target'..."
+  local remote_cmd
+  remote_cmd="mkdir -p $(shell_quote "$target") && gzip -d | tar -xpf -${transform_arg} -C $(shell_quote "$target")${owner_group_args}"
+  tar -czf - -C / "${rel_paths[@]}" \
+    | ssh "$remote_host" "$remote_cmd"
+  echo "Extraction complete."
 }
 
 cmd_unarchive() {
@@ -289,9 +320,6 @@ main() {
   shift
 
   case "$subcmd" in
-    scp)
-      cmd_scp "$@"
-      ;;
     archive)
       cmd_archive "$@"
       ;;

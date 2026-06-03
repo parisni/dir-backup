@@ -1,12 +1,13 @@
 # dir-backup
 
-`dir-backup` streams directories and files between hosts using `tar + gzip`,
-without ever writing the archive to disk on the network path.
+`dir-backup` packs files and directories into a `tar + gzip` archive, locally or
+streamed to a remote host over SSH, without writing the archive to disk on the
+network path.
 
-It provides three subcommands:
+It provides two subcommands:
 
-- `scp` — stream a local directory to a remote host and extract it there in one pass.
-- `archive` — pack one or more local files/directories into a local `.tar.gz`.
+- `archive` — pack one or more local files/directories into a `.tar.gz`, written
+  locally or streamed to a remote host (optionally extracted there with `--extract`).
 - `unarchive` — extract a local or remote `.tar.gz`, optionally remapping path prefixes.
   Remote archives are streamed over SSH and never downloaded to local disk.
 
@@ -37,22 +38,18 @@ sudo mv dir-backup /usr/local/bin/dir-backup
 ## Usage
 
 ```bash
-dir-backup scp [--owner OWNER] [--group GROUP] <local_abs_path> <user@host:/remote_abs_path>
-dir-backup archive <output.tar.gz> <abs_path_or_file1> [<abs_path_or_file2> ...]
+dir-backup archive [--extract [--remap OLD_PREFIX:NEW_PREFIX] [--dest /remote_dir]] [--owner OWNER] [--group GROUP] <output> <abs_path1> [<abs_path2> ...]
 dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
 ```
 
-### `scp`
-
-- Directory-only; `local_abs_path` must be an absolute directory path.
-- Data is streamed: local `tar | gzip` → SSH → remote `gzip -d | tar -x`.
-- Remote destination is created if missing.
-- `--owner` and `--group` apply only when the SSH user is `root`. Otherwise files are owned by the SSH connection user.
-
 ### `archive`
 
-- Packs one or more files or directories into a local `.tar.gz`.
-- Source paths and the output path must be absolute.
+- Packs one or more files or directories into a `.tar.gz`.
+- Source paths must be absolute.
+- `<output>` is local when absolute (`/path.tar.gz`) and remote when a remote-spec (`user@host:/path.tar.gz`); a leading `/` always means local.
+- A remote `<output>` streams the data and writes the raw `.tar.gz` remotely (no local copy is kept).
+- `--extract` (remote only) extracts the stream on the remote host instead of writing the archive. Paths are stored relative to `/`, restoring absolute locations; `--dest /dir` extracts relative to a directory and `--remap OLD:NEW` rewrites a prefix.
+- `--owner`/`--group` force ownership when extracting remotely (effective only when the SSH user is `root`).
 - Paths are stored relative to `/` so `unarchive` can restore them to their original absolute locations.
 
 ### `unarchive`
@@ -65,16 +62,16 @@ dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host
 
 ## Examples
 
-Copy local directory contents into a remote target directory:
+Stream the raw `.tar.gz` to a remote host:
 
 ```bash
-dir-backup scp /tmp/gimp/ user@host:/tmp/gimp/
+dir-backup archive user@host:/tmp/backup.tar.gz /tmp/gimp
 ```
 
-Try forcing ownership/group during extraction (effective only when SSH user is `root`):
+Stream and extract remotely, forcing ownership/group (effective only when SSH user is `root`):
 
 ```bash
-dir-backup scp --owner backup --group backup /tmp/gimp/ user@host:/tmp/gimp/
+dir-backup archive --extract --owner backup --group backup user@host:/ignored.tar.gz /tmp/gimp
 ```
 
 Create a local archive of multiple absolute paths:
@@ -116,5 +113,5 @@ dir-backup unarchive --remap /home/nparis:/home/parisni \
 
 ## Notes on ownership
 
-- `scp`'s `--owner` / `--group` only take effect when the SSH user on the remote is `root`. Otherwise extracted files are owned by the SSH connection user.
+- `archive --extract`'s `--owner` / `--group` only take effect when the SSH user on the remote is `root`. Otherwise extracted files are owned by the SSH connection user.
 - `unarchive` does not currently expose `--owner` / `--group`; extracted files are owned by the local user running the command (or preserved from the archive when run as `root`, per `tar`'s defaults).
