@@ -39,7 +39,7 @@ sudo mv dir-backup /usr/local/bin/dir-backup
 
 ```bash
 dir-backup archive [--compression gzip|zstd] [--extract [--remap OLD_PREFIX:NEW_PREFIX] [--dest /remote_dir]] [--owner OWNER] [--group GROUP] <output> <abs_path1> [<abs_path2> ...]
-dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
+dir-backup unarchive [--progress] [--keep-old-files] [--download /local/file [--retries N] [--rm-download]] [--remap OLD_PREFIX:NEW_PREFIX] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
 ```
 
 ### `archive`
@@ -56,8 +56,12 @@ dir-backup unarchive [--remap OLD_PREFIX:NEW_PREFIX] <archive.tar.gz | user@host
 ### `unarchive`
 
 - Source can be a local archive (`/abs/path/file.tar.gz`) or a remote one (`user@host:/abs/path/file.tar.gz`).
-- The compression format (gzip or zstd) is detected automatically; `zstd` must be installed where the archive is decompressed (locally, or on the remote for streamed sources).
-- Remote sources are streamed over SSH (`ssh host 'cat …' | tar -xzf -`) and are never written to local disk.
+- The compression format (gzip or zstd) is detected automatically; `zstd` must be installed locally for zstd archives.
+- Remote sources are streamed compressed over SSH (`ssh host 'cat …' | zstd -dc | tar -xf -`), decompressed locally, and never written to local disk. SSH keepalives (`ServerAliveInterval=30`, `ServerAliveCountMax=6`) are enabled.
+- `--progress` shows a `pv` progress bar measured on the compressed archive size.
+- `--keep-old-files` never overwrites existing files (`tar -k`). Use it to resume an interrupted restore; delete the last, partially extracted file reported by `tar` first, since it would otherwise be kept as is.
+- `--download /local/file` (remote sources only) copies the archive locally with `rsync --partial` before extracting it, instead of streaming. The download resumes where it stopped and is retried automatically on network errors (`--retries N`, default 5, 10 s apart); re-running the same command also resumes it. The local copy is kept unless `--rm-download` is given. Requires `rsync` locally and on the remote.
+- `--exclude-folder NAME` skips any directory whose basename equals `NAME`, at any depth. Repeatable.
 - Without `<dest_dir>`, files are restored to their original absolute paths (extraction relative to `/`).
 - With `<dest_dir>`, files are extracted relative to that directory.
 - `--remap OLD_PREFIX:NEW_PREFIX` rewrites a leading path prefix at extraction time via `tar --transform`. Both prefixes are interpreted relative to the archive layout (leading `/` is stripped automatically).
@@ -111,6 +115,20 @@ Same, with a path remap applied on the fly:
 ```bash
 dir-backup unarchive --remap /home/nparis:/home/parisni \
   user@host:/srv/backups/site.tar.gz /tmp/restore
+```
+
+Resume an interrupted remote restore without overwriting already extracted files:
+
+```bash
+dir-backup unarchive --progress --keep-old-files --exclude-folder .venv \
+  user@host:/srv/backups/site.tar.zst /tmp/restore
+```
+
+Download a large remote archive first (resumable), then extract it locally:
+
+```bash
+dir-backup unarchive --download /tmp/site.tar.zst --progress --keep-old-files \
+  user@host:/srv/backups/site.tar.zst /tmp/restore
 ```
 
 ## Notes on ownership

@@ -6,11 +6,15 @@ set -euo pipefail
 # When unreplaced (local dev / git clone), `--version` reports "dev".
 VERSION="__VERSION__"
 
+# Keep long-running SSH streams alive across idle NAT/firewall timeouts and
+# detect dead peers instead of hanging forever.
+SSH_OPTS=(-o ServerAliveInterval=30 -o ServerAliveCountMax=6)
+
 usage() {
   cat <<'EOF'
 Usage:
   dir-backup archive [--compression gzip|zstd] [--extract [--remap OLD_PREFIX:NEW_PREFIX] [--dest /remote_dir]] [--owner OWNER] [--group GROUP] <output> <abs_path1> [<abs_path2> ...]
-  dir-backup unarchive [--progress] [--remap OLD_PREFIX:NEW_PREFIX] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
+  dir-backup unarchive [--progress] [--keep-old-files] [--download /local/file [--retries N] [--rm-download]] [--remap OLD_PREFIX:NEW_PREFIX] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]
   dir-backup --version | -V | version
 
 Notes:
@@ -31,7 +35,13 @@ Notes:
   - `unarchive` with <dest_dir> extracts relative to that directory.
   - `unarchive --remap` rewrites a path prefix at extraction time (e.g. /home/nparis:/home/parisni).
   - `unarchive` streams the archive over SSH when the source is `user@host:/abs/path`; nothing is downloaded to disk.
+    The compressed bytes are transferred and decompressed locally (`zstd` must be installed locally for zstd archives).
+  - SSH connections use keepalives (ServerAliveInterval=30, ServerAliveCountMax=6).
   - `unarchive --progress` shows a transfer progress bar via `pv` (requires `pv` to be installed; e.g. `apt-get install pv`).
+  - `unarchive --keep-old-files` never overwrites files that already exist (tar -k); useful to resume an interrupted restore.
+  - `unarchive --download /local/file` (remote source only) first copies the archive locally with
+    `rsync --partial` (resumable, retried up to `--retries N` times on network errors, default 5),
+    then extracts the local copy. The copy is kept unless `--rm-download` is given. Requires rsync on both sides.
   - `unarchive --exclude-folder NAME` skips any directory whose basename equals NAME, at any depth (literal name, no globs). Repeatable.
 EOF
 }
@@ -58,6 +68,33 @@ parse_remote() {
 shell_quote() {
   local s="$1"
   printf "'%s'" "${s//\'/\'\"\'\"\'}"
+}
+
+# file_size <path> -> prints the size in bytes (GNU stat, then BSD/macOS stat).
+file_size() {
+  stat -c %s -- "$1" 2>/dev/null || stat -f %z -- "$1" 2>/dev/null
+}
+
+# download_remote <host> <remote_path> <local_path> <retries>
+# Resumable copy via rsync --partial; retries on network/transfer errors.
+download_remote() {
+  local host="$1" rpath="$2" lpath="$3" retries="$4"
+  local attempt=0 rc
+  while :; do
+    if rsync --partial --progress -e "ssh ${SSH_OPTS[*]}" -- "${host}:${rpath}" "$lpath"; then
+      return 0
+    else
+      rc=$?
+    fi
+    case "$rc" in
+      10|11|12|23|30|35|255) ;;
+      *) die "rsync failed (exit $rc)" ;;
+    esac
+    attempt=$((attempt + 1))
+    [[ "$attempt" -le "$retries" ]] || die "rsync failed (exit $rc) after $retries retries"
+    echo "rsync interrupted (exit $rc); retry $attempt/$retries in 10s..." >&2
+    sleep 10
+  done
 }
 
 cmd_archive() {
@@ -169,7 +206,7 @@ cmd_archive() {
     # Deposit the raw archive remotely; no local copy is written. The remote only
     # runs `cat`, so it needs no decompressor here regardless of --compression.
     tar -c "$tar_compress_flag" -f - -C / "${rel_paths[@]}" \
-      | ssh "$remote_host" "cat > $(shell_quote "$remote_path")"
+      | ssh "${SSH_OPTS[@]}" "$remote_host" "cat > $(shell_quote "$remote_path")"
     echo "Archive complete."
     return
   fi
@@ -213,27 +250,39 @@ cmd_archive() {
   local remote_cmd
   remote_cmd="${remote_guard}mkdir -p $(shell_quote "$target") && tar -x ${tar_compress_flag} -pf -${transform_arg} -C $(shell_quote "$target")${owner_group_args}"
   tar -c "$tar_compress_flag" -f - -C / "${rel_paths[@]}" \
-    | ssh "$remote_host" "$remote_cmd"
+    | ssh "${SSH_OPTS[@]}" "$remote_host" "$remote_cmd"
   echo "Extraction complete."
 }
 
 # tar can only autodetect the compression format from a seekable file, not from a
-# pipe. For streamed extractions we therefore decompress on the side that holds
-# the seekable file (locally, or on the remote) by sniffing the magic bytes and
-# choosing the matching decompressor, then feed an uncompressed tar stream into
-# `tar -xf -`. `gzip`/`zstd` magic: 1f8b / 28b52ffd.
+# pipe. For streamed extractions we therefore sniff the magic bytes on the side
+# that holds the seekable file and pick the matching decompressor, then feed an
+# uncompressed tar stream into `tar -xf -`. `gzip`/`zstd` magic: 1f8b / 28b52ffd.
 #
-# decompress_cmd <quoted_path> -> emits a shell snippet that writes the
-# uncompressed tar bytes of <quoted_path> to stdout. The snippet is portable
-# enough to run locally (eval) or remotely (over ssh).
-decompress_cmd() {
+# magic_cmd <quoted_path> -> emits a shell snippet printing the first 4 bytes of
+# <quoted_path> as hex. Portable enough to run locally (eval) or over ssh.
+magic_cmd() {
   local qpath="$1"
-  printf '%s' "magic=\$(head -c 4 -- ${qpath} | od -An -tx1 | tr -d ' \\n'); case \"\$magic\" in 1f8b*) gzip -dc -- ${qpath};; 28b52ffd*) zstd -dc -- ${qpath};; *) cat -- ${qpath};; esac"
+  printf '%s' "head -c 4 -- ${qpath} | od -An -tx1 | tr -d ' \\n'"
+}
+
+# decompressor_for_magic <hex> -> prints the decompressor command (gzip -dc,
+# zstd -dc or cat) matching the magic bytes, one word per line.
+decompressor_for_magic() {
+  case "$1" in
+    1f8b*) printf '%s\n' gzip -dc ;;
+    28b52ffd*) printf '%s\n' zstd -dc ;;
+    *) printf '%s\n' cat ;;
+  esac
 }
 
 cmd_unarchive() {
   local remap=""
   local progress=0
+  local keep_old=0
+  local download=""
+  local retries=5
+  local rm_download=0
   # Repeatable flag: each entry is a literal folder name to exclude at any depth.
   local -a exclude_folders=()
 
@@ -246,6 +295,25 @@ cmd_unarchive() {
         ;;
       --progress)
         progress=1
+        shift
+        ;;
+      --keep-old-files)
+        keep_old=1
+        shift
+        ;;
+      --download)
+        [[ $# -ge 2 ]] || die "--download requires a value"
+        download="$2"
+        shift 2
+        ;;
+      --retries)
+        [[ $# -ge 2 ]] || die "--retries requires a value"
+        retries="$2"
+        [[ "$retries" =~ ^[0-9]+$ ]] || die "--retries must be a non-negative integer: $retries"
+        shift 2
+        ;;
+      --rm-download)
+        rm_download=1
         shift
         ;;
       --exclude-folder)
@@ -265,7 +333,7 @@ cmd_unarchive() {
     esac
   done
 
-  [[ $# -ge 1 && $# -le 2 ]] || die "unarchive expects: [--progress] [--remap OLD:NEW] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]"
+  [[ $# -ge 1 && $# -le 2 ]] || die "unarchive expects: [--progress] [--keep-old-files] [--download /local/file [--retries N] [--rm-download]] [--remap OLD:NEW] [--exclude-folder NAME]... <archive.tar.gz | user@host:/abs/path/file.tar.gz> [<dest_dir>]"
 
   local archive="$1"
 
@@ -284,17 +352,53 @@ cmd_unarchive() {
     [[ -f "$archive" ]]    || die "archive path must be a regular file: $archive"
   fi
 
+  if [[ -n "$download" ]]; then
+    [[ -n "$remote_host" ]] || die "--download requires a remote archive (user@host:/abs/path)"
+    is_abs_path "$download" || die "--download path must be absolute: $download"
+    [[ ! -d "$download" ]]  || die "--download must be a file path, not a directory: $download"
+    [[ -d "$(dirname -- "$download")" ]] || die "--download parent directory does not exist: $download"
+    command -v rsync >/dev/null 2>&1 || die "--download requires rsync locally"
+    ssh "${SSH_OPTS[@]}" "$remote_host" "command -v rsync >/dev/null 2>&1" \
+      || die "--download requires rsync on the remote: $remote_host"
+  else
+    [[ "$rm_download" -eq 0 ]] || die "--rm-download requires --download"
+  fi
+
   # --progress relies on `pv` (https://www.ivarch.com/programs/pv.shtml) to render
   # a real progress bar with ETA. We require both `pv` and a known byte size so
   # the bar is meaningful; otherwise we fail fast rather than degrade silently.
-  local archive_size=""
   if [[ "$progress" -eq 1 ]]; then
     command -v pv >/dev/null 2>&1 || die "--progress requires pv (e.g. apt-get install pv)"
+  fi
+
+  local extract_dir
+  if [[ $# -eq 2 ]]; then
+    extract_dir="$2"
+    is_abs_path "$extract_dir" || die "dest_dir must be absolute: $extract_dir"
+    [[ -e "$extract_dir" ]]   || die "dest_dir does not exist: $extract_dir"
+    [[ -d "$extract_dir" ]]   || die "dest_dir must be a directory: $extract_dir"
+  else
+    # Archive stores paths relative to /; extract to / restores absolute locations
+    extract_dir="/"
+  fi
+
+  # --download: copy the remote archive locally first (resumable), then extract
+  # it as a local archive.
+  if [[ -n "$download" ]]; then
+    echo "Downloading '$archive' to '$download'..."
+    download_remote "$remote_host" "$remote_path" "$download" "$retries"
+    archive="$download"
+    remote_host=""
+    remote_path=""
+  fi
+
+  local archive_size=""
+  if [[ "$progress" -eq 1 ]]; then
     if [[ -n "$remote_host" ]]; then
-      archive_size="$(ssh "$remote_host" "stat -c %s -- $(shell_quote "$remote_path")" 2>/dev/null)" \
+      archive_size="$(ssh "${SSH_OPTS[@]}" "$remote_host" "stat -c %s -- $(shell_quote "$remote_path")" 2>/dev/null)" \
         || die "could not stat remote archive: $remote_host:$remote_path"
     else
-      archive_size="$(stat -c %s -- "$archive" 2>/dev/null)" \
+      archive_size="$(file_size "$archive")" \
         || die "could not stat local archive: $archive"
     fi
     [[ "$archive_size" =~ ^[0-9]+$ ]] || die "could not determine archive size for --progress"
@@ -320,45 +424,63 @@ cmd_unarchive() {
     exclude_args+=("--exclude=$name" "--exclude=*/$name")
   done
 
-  local extract_dir
+  local -a tar_args=()
+  if [[ -n "$transform_arg" ]]; then
+    tar_args+=("$transform_arg")
+  fi
+  tar_args+=("${exclude_args[@]}")
+  if [[ "$keep_old" -eq 1 ]]; then
+    tar_args+=(-k)
+  fi
+
   if [[ $# -eq 2 ]]; then
-    extract_dir="$2"
-    is_abs_path "$extract_dir" || die "dest_dir must be absolute: $extract_dir"
-    [[ -e "$extract_dir" ]]   || die "dest_dir does not exist: $extract_dir"
-    [[ -d "$extract_dir" ]]   || die "dest_dir must be a directory: $extract_dir"
     echo "Extracting '$archive' into '$extract_dir'..."
   else
-    # Archive stores paths relative to /; extract to / restores absolute locations
-    extract_dir="/"
     echo "Extracting '$archive' to original paths..."
   fi
 
   if [[ -n "$remote_host" ]]; then
-    # Stream archive bytes over SSH directly into local tar; nothing is written to
-    # disk. The remote holds the seekable file, so it sniffs the format and emits
-    # an uncompressed tar stream, which lets local `tar -xf -` read from the pipe
-    # (tar cannot autodetect compression from a pipe).
-    local remote_decompress
-    remote_decompress="$(decompress_cmd "$(shell_quote "$remote_path")")"
+    # Stream the compressed archive bytes over SSH and decompress locally;
+    # nothing is written to disk. The remote holds the seekable file, so the
+    # format is sniffed there first (tar cannot autodetect from a pipe).
+    local qremote magic
+    qremote="$(shell_quote "$remote_path")"
+    magic="$(ssh "${SSH_OPTS[@]}" "$remote_host" "$(magic_cmd "$qremote")")" \
+      || die "could not read remote archive: $remote_host:$remote_path"
+    local -a local_decompress
+    mapfile -t local_decompress < <(decompressor_for_magic "$magic")
+    command -v "${local_decompress[0]}" >/dev/null 2>&1 \
+      || die "${local_decompress[0]} not found in PATH (required to decompress the archive locally)"
     if [[ "$progress" -eq 1 ]]; then
-      ssh "$remote_host" "$remote_decompress" \
+      ssh "${SSH_OPTS[@]}" "$remote_host" "cat -- $qremote" \
         | pv -s "$archive_size" \
-        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xf - -C "$extract_dir"
+        | "${local_decompress[@]}" \
+        | tar "${tar_args[@]}" -xf - -C "$extract_dir"
     else
-      ssh "$remote_host" "$remote_decompress" \
-        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xf - -C "$extract_dir"
+      ssh "${SSH_OPTS[@]}" "$remote_host" "cat -- $qremote" \
+        | "${local_decompress[@]}" \
+        | tar "${tar_args[@]}" -xf - -C "$extract_dir"
     fi
   else
     if [[ "$progress" -eq 1 ]]; then
-      # pv feeds a pipe, so decompress explicitly (sniffed from the seekable file)
-      # before tar, which cannot autodetect compression from a pipe.
-      eval "$(decompress_cmd "$(shell_quote "$archive")")" \
-        | pv -s "$archive_size" \
-        | tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xf - -C "$extract_dir"
+      # pv measures the compressed file, so decompress explicitly (sniffed from
+      # the seekable file) before tar, which cannot autodetect from a pipe.
+      local -a local_decompress
+      mapfile -t local_decompress < <(decompressor_for_magic "$(eval "$(magic_cmd "$(shell_quote "$archive")")")")
+      command -v "${local_decompress[0]}" >/dev/null 2>&1 \
+        || die "${local_decompress[0]} not found in PATH (required to decompress the archive)"
+      pv -s "$archive_size" -- "$archive" \
+        | "${local_decompress[@]}" \
+        | tar "${tar_args[@]}" -xf - -C "$extract_dir"
     else
       # Local seekable file: tar autodetects gzip/zstd on its own.
-      tar ${transform_arg:+"$transform_arg"} "${exclude_args[@]}" -xf "$archive" -C "$extract_dir"
+      tar "${tar_args[@]}" -xf "$archive" -C "$extract_dir"
     fi
+  fi
+
+  if [[ "$rm_download" -eq 1 ]]; then
+    rm -f -- "$download"
+    echo "Removed downloaded archive '$download'."
   fi
 
   echo "Extraction complete."
